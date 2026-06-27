@@ -66,13 +66,9 @@
         // --- Configuration ---
         const VOXEL_SIZE = 0.5;
         const GRID_SIZE = 10;
-        const TRACKED_JOINTS = [
-            { name: 'palm', size: { x: 0.07, y: 0.02, z: 0.07 }, color: 0x34495e },
-            { name: 'thumb-phalanx-distal', size: { x: 0.02, y: 0.02, z: 0.02 }, color: 0x2980b9 },
-            { name: 'index-finger-phalanx-distal', size: { x: 0.018, y: 0.018, z: 0.018 }, color: 0x3498db },
-            { name: 'middle-finger-phalanx-distal', size: { x: 0.018, y: 0.018, z: 0.018 }, color: 0x3498db },
-            { name: 'ring-finger-phalanx-distal', size: { x: 0.017, y: 0.017, z: 0.017 }, color: 0x3498db },
-            { name: 'pinky-finger-phalanx-distal', size: { x: 0.015, y: 0.015, z: 0.015 }, color: 0x2980b9 }
+        const CONTROLLER_PROXIES = [
+            { id: 0, hand: 'left', size: { x: 0.08, y: 0.06, z: 0.12 }, color: 0x34495e },
+            { id: 1, hand: 'right', size: { x: 0.08, y: 0.06, z: 0.12 }, color: 0x2c3e50 }
         ];
 
         // --- State ---
@@ -199,52 +195,48 @@
 
         function setupVR() {
             const controllerModelFactory = new XRControllerModelFactory();
+            physicalVoxelJoints = [];
 
             for (let i = 0; i < 2; i++) {
-                // Controllers (Grip)
+                // Fetch the controller grip group from Three.js
                 const grip = renderer.xr.getControllerGrip(i);
                 grip.add(controllerModelFactory.createControllerModel(grip));
                 scene.add(grip);
 
-                // Hands
-                const hand = renderer.xr.getHand(i);
-                scene.add(hand);
-                hands.push(hand);
+                // Find the configuration matching this index
+                const config = CONTROLLER_PROXIES[i];
 
-                // Graphics meshes for each joint
-                TRACKED_JOINTS.forEach(config => {
-                    const mesh = new THREE.Mesh(
-                        new THREE.BoxGeometry(config.size.x, config.size.y, config.size.z),
-                        new THREE.MeshStandardMaterial({ color: config.color, roughness: 0.7 })
-                    );
-                    mesh.visible = false;
-                    scene.add(mesh);
+                // Create the visual box mesh that matches the controller position
+                const mesh = new THREE.Mesh(
+                    new THREE.BoxGeometry(config.size.x, config.size.y, config.size.z),
+                    new THREE.MeshStandardMaterial({ color: config.color, roughness: 0.5 })
+                );
+                mesh.visible = true;
+                scene.add(mesh);
 
-                    physicalVoxelJoints.push({
-                        mesh: mesh,
-                        body: null,
-                        handRef: hand,
-                        jointName: config.name,
-                        configSize: config.size
-                    });
+                physicalVoxelJoints.push({
+                    mesh: mesh,
+                    body: null,
+                    gripRef: grip,
+                    configSize: config.size
                 });
             }
         }
 
         function setupHandPhysicsColliders() {
             if (!RAPIER || !physicsWorld) return;
-            log('Attaching kinematic colliders to voxel joints...');
+            log('Attaching kinematic colliders to VR controllers...');
 
-            physicalVoxelJoints.forEach(jointItem => {
+            physicalVoxelJoints.forEach(item => {
                 const bodyDesc = RAPIER.RigidBodyDesc.kinematicPositionBased();
                 const body = physicsWorld.createRigidBody(bodyDesc);
                 const colDesc = RAPIER.ColliderDesc.cuboid(
-                    jointItem.configSize.x / 2,
-                    jointItem.configSize.y / 2,
-                    jointItem.configSize.z / 2
+                    item.configSize.x / 2,
+                    item.configSize.y / 2,
+                    item.configSize.z / 2
                 );
                 physicsWorld.createCollider(colDesc, body);
-                jointItem.body = body;
+                item.body = body;
             });
         }
 
@@ -255,29 +247,26 @@
                 firstFrame = false;
             }
 
-            // Sync Hands
-            const tempPos = new THREE.Vector3();
-            const tempQuat = new THREE.Quaternion();
+            // Sync VR Controllers -> Physics Engine
+            const tempScale = new THREE.Vector3();
 
-            physicalVoxelJoints.forEach(({ mesh, body, handRef, jointName }) => {
-                // Fix: Access joints directly from the Three.js joints object
-                const joint = handRef.joints ? handRef.joints[jointName] : null;
-
-                if (handRef.visible && joint) {
-                    joint.getWorldPosition(tempPos);
-                    joint.getWorldQuaternion(tempQuat);
-                    mesh.position.copy(tempPos);
-                    mesh.quaternion.copy(tempQuat);
+            physicalVoxelJoints.forEach(({ mesh, body, gripRef }) => {
+                if (gripRef && gripRef.matrixWorld) {
+                    // Extract global position and rotation straight from the grip matrix
+                    gripRef.matrixWorld.decompose(mesh.position, mesh.quaternion, tempScale);
                     mesh.visible = true;
 
+                    // Feed the live coordinates directly into Rapier
                     if (body) {
-                        body.setNextKinematicTranslation({ x: tempPos.x, y: tempPos.y, z: tempPos.z });
-                        body.setNextKinematicRotation({ x: tempQuat.x, y: tempQuat.y, z: tempQuat.z, w: tempQuat.w });
+                        const pos = mesh.position;
+                        const quat = mesh.quaternion;
+                        body.setNextKinematicTranslation({ x: pos.x, y: pos.y, z: pos.z });
+                        body.setNextKinematicRotation({ x: quat.x, y: quat.y, z: quat.z, w: quat.w });
                     }
                 } else {
                     mesh.visible = false;
                     if (body) {
-                        body.setNextKinematicTranslation({ x: 0, y: -100, z: 0 });
+                        body.setNextKinematicTranslation({ x: 0, y: -100, z: 0 }); // Park away
                     }
                 }
             });
