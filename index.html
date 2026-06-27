@@ -106,7 +106,7 @@
             scene = new THREE.Scene();
             scene.background = new THREE.Color(0x3498db); // Bright blue background
 
-            // Create Player Rig Group for Locomotion
+            // Fix 1: Create Player Rig Group for Locomotion
             playerGroup = new THREE.Group();
             scene.add(playerGroup);
 
@@ -200,32 +200,46 @@
             physicalVoxelJoints = [];
 
             for (let i = 0; i < 2; i++) {
-                // Controller input object (essential for tracking gamepad thumbsticks)
+                // Controller group handles ray inputs/gamepad maps
                 const controller = renderer.xr.getController(i);
                 playerGroup.add(controller);
 
-                // Controller grip object (best reference for visual hand/handle center)
+                // Controller grip group handles physical controller positioning
                 const grip = renderer.xr.getControllerGrip(i);
                 grip.add(controllerModelFactory.createControllerModel(grip));
-                playerGroup.add(grip); // Controllers must attach to playerGroup so they move when walking
+                playerGroup.add(grip); // Must attach to player rig container
 
                 const config = CONTROLLER_PROXIES[i];
 
-                // Create the visual box mesh that matches the controller position
+                // Create visual proxy box representation
                 const mesh = new THREE.Mesh(
                     new THREE.BoxGeometry(config.size.x, config.size.y, config.size.z),
                     new THREE.MeshStandardMaterial({ color: config.color, roughness: 0.5 })
                 );
-                mesh.visible = false; // Hidden until tracking acquisition flags true
-                scene.add(mesh);
 
-                physicalVoxelJoints.push({
+                // Fix 2: Nest mesh directly into grip group. Three.js now tracks its layout locally
+                grip.add(mesh);
+
+                const item = {
                     mesh: mesh,
                     body: null,
                     gripRef: grip,
                     controllerRef: controller,
-                    configSize: config.size
+                    configSize: config.size,
+                    inputSource: null
+                };
+
+                // Safely track session input connection lifecycle
+                controller.addEventListener('connected', (event) => {
+                    item.inputSource = event.data;
+                    log('Connected controller: ' + event.data.handedness);
                 });
+                controller.addEventListener('disconnected', () => {
+                    item.inputSource = null;
+                    log('Controller disconnected');
+                });
+
+                physicalVoxelJoints.push(item);
             }
         }
 
@@ -254,36 +268,43 @@
         const camRotation = new THREE.Quaternion();
 
         function handleLocomotion() {
-            physicalVoxelJoints.forEach(({ controllerRef }) => {
-                if (controllerRef && controllerRef.inputSource && controllerRef.inputSource.gamepad) {
-                    const source = controllerRef.inputSource;
-                    const gamepad = source.gamepad;
+            physicalVoxelJoints.forEach((item) => {
+                if (item.inputSource && item.inputSource.gamepad) {
+                    const gamepad = item.inputSource.gamepad;
 
-                    // Isolate Left Thumbstick for locomotion
-                    if (source.handedness === 'left') {
-                        const xAxis = gamepad.axes[2] || 0; // Left / Right
-                        const yAxis = gamepad.axes[3] || 0; // Forward / Backward
+                    // Walk using Left Controller
+                    if (item.inputSource.handedness === 'left') {
+                        // Fix 3: Handle structural differences in WebXR gamepad mapping layouts safely
+                        let xAxis = 0;
+                        let yAxis = 0;
+                        if (gamepad.axes.length >= 4) {
+                            xAxis = Math.abs(gamepad.axes[2]) > 0.1 ? gamepad.axes[2] : gamepad.axes[0];
+                            yAxis = Math.abs(gamepad.axes[3]) > 0.1 ? gamepad.axes[3] : gamepad.axes[1];
+                        } else if (gamepad.axes.length >= 2) {
+                            xAxis = gamepad.axes[0];
+                            yAxis = gamepad.axes[1];
+                        }
 
-                        // Deadzone threshold filter
+                        // Filter active input through a minimal drift deadzone
                         if (Math.abs(xAxis) > 0.1 || Math.abs(yAxis) > 0.1) {
                             camera.getWorldQuaternion(camRotation);
 
-                            // Project camera vector straight ahead onto horizontal XZ ground plane
+                            // Project looking direction flatly onto the ground plane (XZ plane)
                             frontVector.set(0, 0, -1).applyQuaternion(camRotation);
                             frontVector.y = 0;
                             frontVector.normalize();
 
-                            // Project camera sideways vector onto horizontal XZ plane
+                            // Project normal side looking vectors flatly onto ground plane
                             sideVector.set(1, 0, 0).applyQuaternion(camRotation);
                             sideVector.y = 0;
                             sideVector.normalize();
 
-                            // Aggregate thumbstick axes (WebXR standard maps up to negative Y)
+                            // Accumulate vectors (WebXR up on stick is negative Y)
                             moveDirection.copy(frontVector).multiplyScalar(-yAxis);
                             moveDirection.addScaledVector(sideVector, xAxis);
                             moveDirection.normalize().multiplyScalar(moveSpeed);
 
-                            // Shift the entire tracking envelope
+                            // Translate the entire local tracking ecosystem container
                             playerGroup.position.add(moveDirection);
                         }
                     }
@@ -291,29 +312,35 @@
             });
         }
 
+        const tempPos = new THREE.Vector3();
+        const tempQuat = new THREE.Quaternion();
+
         function update() {
-            // Apply walking vector adjustments to player rig
+            // Apply joystick motion offsets
             handleLocomotion();
 
-            // Sync VR Controllers -> Physics Engine
-            const tempScale = new THREE.Vector3();
+            // Core Fix: Force scene matrix tree recalculation before polling positions for Rapier
+            if (playerGroup) {
+                playerGroup.updateMatrixWorld(true);
+            }
 
-            physicalVoxelJoints.forEach(({ mesh, body, gripRef }) => {
-                // Critical Fix: Only calculate tracking position if WebXR flags the device active
-                if (gripRef && gripRef.visible) {
-                    gripRef.matrixWorld.decompose(mesh.position, mesh.quaternion, tempScale);
-                    mesh.visible = true;
+            // Sync WebXR Tracked Grips -> Rapier Kinematic Bodies
+            physicalVoxelJoints.forEach((item) => {
+                if (item.gripRef && item.gripRef.visible) {
+                    item.mesh.visible = true;
 
-                    if (body) {
-                        const pos = mesh.position;
-                        const quat = mesh.quaternion;
-                        body.setNextKinematicTranslation({ x: pos.x, y: pos.y, z: pos.z });
-                        body.setNextKinematicRotation({ x: quat.x, y: quat.y, z: quat.z, w: quat.w });
+                    // Capture absolute world coordinates (accounts for parent rig walking position updates)
+                    item.mesh.getWorldPosition(tempPos);
+                    item.mesh.getWorldQuaternion(tempQuat);
+
+                    if (item.body) {
+                        item.body.setNextKinematicTranslation({ x: tempPos.x, y: tempPos.y, z: tempPos.z });
+                        item.body.setNextKinematicRotation({ x: tempQuat.x, y: tempQuat.y, z: tempQuat.z, w: tempQuat.w });
                     }
                 } else {
-                    mesh.visible = false;
-                    if (body) {
-                        body.setNextKinematicTranslation({ x: 0, y: -100, z: 0 }); // Park safe
+                    item.mesh.visible = false;
+                    if (item.body) {
+                        item.body.setNextKinematicTranslation({ x: 0, y: -100, z: 0 }); // Move safely away
                     }
                 }
             });
@@ -321,6 +348,7 @@
             if (physicsWorld) {
                 physicsWorld.step();
 
+                // Dynamic simulation sync updates
                 physicsBodies.forEach(({ mesh, body }) => {
                     if (!body) return;
                     const t = body.translation();
