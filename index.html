@@ -26,6 +26,7 @@
             padding: 10px;
             border-radius: 8px;
             pointer-events: none;
+            z-index: 10;
         }
     </style>
     <script async src="https://unpkg.com/es-module-shims@1.6.3/dist/es-module-shims.js"></script>
@@ -65,7 +66,14 @@
         // --- Configuration ---
         const VOXEL_SIZE = 0.5;
         const GRID_SIZE = 10;
-        const SPAWN_POS = new THREE.Vector3(0, 1.6, 2);
+        const TRACKED_JOINTS = [
+            { name: 'palm', size: { x: 0.07, y: 0.02, z: 0.07 }, color: 0x34495e },
+            { name: 'thumb-phalanx-distal', size: { x: 0.02, y: 0.02, z: 0.02 }, color: 0x2980b9 },
+            { name: 'index-finger-phalanx-distal', size: { x: 0.018, y: 0.018, z: 0.018 }, color: 0x3498db },
+            { name: 'middle-finger-phalanx-distal', size: { x: 0.018, y: 0.018, z: 0.018 }, color: 0x3498db },
+            { name: 'ring-finger-phalanx-distal', size: { x: 0.017, y: 0.017, z: 0.017 }, color: 0x3498db },
+            { name: 'pinky-finger-phalanx-distal', size: { x: 0.015, y: 0.015, z: 0.015 }, color: 0x2980b9 }
+        ];
 
         // --- State ---
         let scene, camera, renderer, physicsWorld;
@@ -74,32 +82,36 @@
         let physicsBodies = [];
         let physicalVoxelJoints = [];
 
-        // --- Physics Initialization ---
-        log('Attempting to load Rapier...');
+        // --- Start Engine Immediately ---
+        init();
+
+        // --- Load Physics in Background ---
+        log('Starting background Rapier load...');
         import('https://cdn.jsdelivr.net/npm/@dimforge/rapier3d-compat@0.11.2/rapier.es.js').then(async (R) => {
-            log('Rapier module loaded, initializing WASM...');
+            log('Rapier module ready.');
             try {
                 await R.init();
                 RAPIER = R;
-                log('Rapier initialized successfully.');
-                setStatus('Ready');
-                init();
+                log('Rapier WASM initialized.');
+                setupPhysics();
+                setupHandPhysicsColliders(); // Generate physics targets AFTER Rapier initializes safely
+                setStatus('Physics Active');
             } catch (e) {
                 log('Rapier Init Error: ' + e.message);
-                setStatus('Rapier Error');
+                setStatus('Physics Failed');
             }
         }).catch(err => {
             log('Rapier Load Error: ' + err.message);
-            setStatus('Load Failed');
+            setStatus('Network Error');
         });
 
         function init() {
-            log('Initializing Three.js Scene...');
+            log('Initializing Three.js...');
             scene = new THREE.Scene();
-            scene.background = new THREE.Color(0x202028); // Lighter background to check if rendering
+            scene.background = new THREE.Color(0x3498db); // Bright blue background to verify rendering
 
-            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 100);
-            camera.position.copy(SPAWN_POS);
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 1000);
+            camera.position.set(0, 1.6, 3); // Start 3 meters back
 
             renderer = new THREE.WebGLRenderer({ antialias: true });
             renderer.setPixelRatio(window.devicePixelRatio);
@@ -109,50 +121,61 @@
             document.body.appendChild(VRButton.createButton(renderer));
 
             // Lighting
-            scene.add(new THREE.AmbientLight(0xffffff, 0.6));
-            const sun = new THREE.DirectionalLight(0xffffff, 0.8);
-            sun.position.set(5, 10, 5);
+            scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+            const sun = new THREE.DirectionalLight(0xffffff, 1.0);
+            sun.position.set(10, 20, 10);
             scene.add(sun);
 
-            // Physics
-            physicsWorld = new RAPIER.World({ x: 0.0, y: -9.81, z: 0.0 });
+            // Reference Sphere
+            const sphere = new THREE.Mesh(new THREE.SphereGeometry(0.5), new THREE.MeshStandardMaterial({ color: 0xffff00 }));
+            sphere.position.set(0, 1.6, -2);
+            scene.add(sphere);
 
-            // Create a Debug Cube (Always visible even if physics fails)
+            // 1. Create Terrain Visuals
+            createTerrainVisuals();
+
+            // 2. Create Debug Objects
             const debugCube = new THREE.Mesh(
-                new THREE.BoxGeometry(0.1, 0.1, 0.1),
+                new THREE.BoxGeometry(0.2, 0.2, 0.2),
                 new THREE.MeshStandardMaterial({ color: 0xff00ff })
             );
-            debugCube.position.set(0, 1.2, -0.2); // Right in front of face
+            debugCube.position.set(0, 1.2, -1);
             scene.add(debugCube);
-            log('Scene objects created.');
 
-            createTerrain();
-            createTestBox();
+            // 3. Setup VR Input (Graphics elements only)
             setupVR();
 
-            window.addEventListener('resize', onResize);
+            log('Starting loop...');
             renderer.setAnimationLoop(update);
         }
 
-        function createTerrain() {
+        function createTerrainVisuals() {
             const geometry = new THREE.BoxGeometry(VOXEL_SIZE, VOXEL_SIZE, VOXEL_SIZE);
-            const material = new THREE.MeshStandardMaterial({ color: 0x27ae60, roughness: 0.8 });
-
+            const mat = new THREE.MeshStandardMaterial({ color: 0x27ae60, roughness: 0.8 });
             for (let x = -GRID_SIZE / 2; x < GRID_SIZE / 2; x++) {
                 for (let z = -GRID_SIZE / 2; z < GRID_SIZE / 2; z++) {
-                    const mesh = new THREE.Mesh(geometry, material);
-                    const px = x * VOXEL_SIZE, py = -VOXEL_SIZE / 2, pz = z * VOXEL_SIZE;
-                    mesh.position.set(px, py, pz);
+                    const mesh = new THREE.Mesh(geometry, mat);
+                    mesh.position.set(x * VOXEL_SIZE, -VOXEL_SIZE / 2, z * VOXEL_SIZE);
                     scene.add(mesh);
-
-                    const body = physicsWorld.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(px, py, pz));
-                    physicsWorld.createCollider(RAPIER.ColliderDesc.cuboid(VOXEL_SIZE / 2, VOXEL_SIZE / 2, VOXEL_SIZE / 2), body);
+                    physicsBodies.push({ mesh, body: null }); // Body added later
                 }
             }
         }
 
-        function createTestBox() {
-            const size = 0.25;
+        function setupPhysics() {
+            log('Building physics world...');
+            physicsWorld = new RAPIER.World({ x: 0.0, y: -9.81, z: 0.0 });
+
+            // Add colliders to terrain
+            physicsBodies.forEach(obj => {
+                const p = obj.mesh.position;
+                const body = physicsWorld.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(p.x, p.y, p.z));
+                physicsWorld.createCollider(RAPIER.ColliderDesc.cuboid(VOXEL_SIZE / 2, VOXEL_SIZE / 2, VOXEL_SIZE / 2), body);
+                obj.body = body;
+            });
+
+            // Create Test Box
+            const size = 0.3;
             const mesh = new THREE.Mesh(
                 new THREE.BoxGeometry(size, size, size),
                 new THREE.MeshStandardMaterial({ color: 0xe67e22, roughness: 0.4 })
@@ -173,7 +196,7 @@
             const controllerModelFactory = new XRControllerModelFactory();
 
             for (let i = 0; i < 2; i++) {
-                // Controllers
+                // Controllers (Grip)
                 const grip = renderer.xr.getControllerGrip(i);
                 grip.add(controllerModelFactory.createControllerModel(grip));
                 scene.add(grip);
@@ -183,7 +206,7 @@
                 scene.add(hand);
                 hands.push(hand);
 
-                // Procedural Voxel Joints
+                // Graphics meshes for each joint
                 TRACKED_JOINTS.forEach(config => {
                     const mesh = new THREE.Mesh(
                         new THREE.BoxGeometry(config.size.x, config.size.y, config.size.z),
@@ -192,14 +215,32 @@
                     mesh.visible = false;
                     scene.add(mesh);
 
-                    const bodyDesc = RAPIER.RigidBodyDesc.kinematicPositionBased();
-                    const body = physicsWorld.createRigidBody(bodyDesc);
-                    const colDesc = RAPIER.ColliderDesc.cuboid(config.size.x / 2, config.size.y / 2, config.size.z / 2);
-                    physicsWorld.createCollider(colDesc, body);
-
-                    physicalVoxelJoints.push({ mesh, body, handRef: hand, jointName: config.name });
+                    physicalVoxelJoints.push({
+                        mesh: mesh,
+                        body: null,
+                        handRef: hand,
+                        jointName: config.name,
+                        configSize: config.size
+                    });
                 });
             }
+        }
+
+        function setupHandPhysicsColliders() {
+            if (!RAPIER || !physicsWorld) return;
+            log('Attaching kinematic colliders to voxel joints...');
+
+            physicalVoxelJoints.forEach(jointItem => {
+                const bodyDesc = RAPIER.RigidBodyDesc.kinematicPositionBased();
+                const body = physicsWorld.createRigidBody(bodyDesc);
+                const colDesc = RAPIER.ColliderDesc.cuboid(
+                    jointItem.configSize.x / 2,
+                    jointItem.configSize.y / 2,
+                    jointItem.configSize.z / 2
+                );
+                physicsWorld.createCollider(colDesc, body);
+                jointItem.body = body;
+            });
         }
 
         let firstFrame = true;
@@ -217,37 +258,40 @@
                 const joint = handRef.getJoint(jointName);
 
                 if (handRef.visible && joint && joint.visible) {
-                    // Extract World Transform
                     joint.getWorldPosition(tempPos);
                     joint.getWorldQuaternion(tempQuat);
-
-                    // Sync Graphics
                     mesh.position.copy(tempPos);
                     mesh.quaternion.copy(tempQuat);
                     mesh.visible = true;
 
-                    // Sync Physics
-                    body.setNextKinematicTranslation({ x: tempPos.x, y: tempPos.y, z: tempPos.z });
-                    body.setNextKinematicRotation({ x: tempQuat.x, y: tempQuat.y, z: tempQuat.z, w: tempQuat.w });
+                    if (body) {
+                        body.setNextKinematicTranslation({ x: tempPos.x, y: tempPos.y, z: tempPos.z });
+                        body.setNextKinematicRotation({ x: tempQuat.x, y: tempQuat.y, z: tempQuat.z, w: tempQuat.w });
+                    }
                 } else {
                     mesh.visible = false;
-                    body.setNextKinematicTranslation({ x: 0, y: -100, z: 0 }); // Teleport away
+                    if (body) {
+                        body.setNextKinematicTranslation({ x: 0, y: -100, z: 0 });
+                    }
                 }
             });
 
-            physicsWorld.step();
+            if (physicsWorld) {
+                physicsWorld.step();
 
-            // Sync Dynamic Physics
-            physicsBodies.forEach(({ mesh, body }) => {
-                const t = body.translation();
-                const r = body.rotation();
-                mesh.position.set(t.x, t.y, t.z);
-                mesh.quaternion.set(r.x, r.y, r.z, r.w);
-            });
+                physicsBodies.forEach(({ mesh, body }) => {
+                    if (!body) return;
+                    const t = body.translation();
+                    const r = body.rotation();
+                    mesh.position.set(t.x, t.y, t.z);
+                    mesh.quaternion.set(r.x, r.y, r.z, r.w);
+                });
+            }
 
             renderer.render(scene, camera);
         }
 
+        window.addEventListener('resize', onResize);
         function onResize() {
             camera.aspect = window.innerWidth / window.innerHeight;
             camera.updateProjectionMatrix();
