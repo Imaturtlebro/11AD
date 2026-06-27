@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebXR Voxel Quest Engine</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #1a1a1a;
+            font-family: sans-serif;
+        }
+
+        canvas {
+            display: block;
+        }
+
+        #overlay {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: white;
+            background: rgba(0, 0, 0, 0.5);
+            padding: 10px;
+            border-radius: 8px;
+            pointer-events: none;
+        }
+    </style>
+    <script async src="https://unpkg.com/es-module-shims@1.6.3/dist/es-module-shims.js"></script>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+          "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+        }
+      }
+    </script>
+</head>
+
+<body>
+    <div id="overlay">
+        <h2>WebXR Voxel Engine</h2>
+        <p>Quest 2 Procedural Joint Tracking</p>
+    </div>
+    <script type="module">
+        import * as THREE from 'three';
+        import { VRButton } from 'three/addons/webxr/VRButton.js';
+        import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+
+        // --- Configuration ---
+        const VOXEL_SIZE = 0.5;
+        const GRID_SIZE = 10;
+        const SPAWN_POS = new THREE.Vector3(0, 1.6, 1);
+
+        const TRACKED_JOINTS = [
+            { name: 'palm', size: { x: 0.07, y: 0.02, z: 0.07 }, color: 0x34495e },
+            { name: 'thumb-phalanx-distal', size: { x: 0.02, y: 0.02, z: 0.02 }, color: 0x2980b9 },
+            { name: 'index-finger-phalanx-distal', size: { x: 0.018, y: 0.018, z: 0.018 }, color: 0x3498db },
+            { name: 'middle-finger-phalanx-distal', size: { x: 0.018, y: 0.018, z: 0.018 }, color: 0x3498db },
+            { name: 'ring-finger-phalanx-distal', size: { x: 0.017, y: 0.017, z: 0.017 }, color: 0x3498db },
+            { name: 'pinky-finger-phalanx-distal', size: { x: 0.015, y: 0.015, z: 0.015 }, color: 0x2980b9 }
+        ];
+
+        // --- State ---
+        let scene, camera, renderer, physicsWorld;
+        let RAPIER;
+        let controllers = [], hands = [];
+        let physicsBodies = []; // { mesh, body }
+        let physicalVoxelJoints = []; // { mesh, body, handRef, jointName }
+
+        // --- Physics Initialization ---
+        import('https://cdn.skypack.dev/@dimforge/rapier3d-compat').then(async (R) => {
+            await R.init();
+            RAPIER = R;
+            init();
+        });
+
+        function init() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x101018);
+            scene.fog = new THREE.FogExp2(0x101018, 0.15);
+
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 100);
+            camera.position.copy(SPAWN_POS);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+            document.body.appendChild(VRButton.createButton(renderer));
+
+            // Lighting
+            scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+            const sun = new THREE.DirectionalLight(0xffffff, 1.0);
+            sun.position.set(5, 10, 5);
+            scene.add(sun);
+
+            // Physics
+            physicsWorld = new RAPIER.World({ x: 0.0, y: -9.81, z: 0.0 });
+
+            createTerrain();
+            createTestBox();
+            setupVR();
+
+            window.addEventListener('resize', onResize);
+            renderer.setAnimationLoop(update);
+        }
+
+        function createTerrain() {
+            const geometry = new THREE.BoxGeometry(VOXEL_SIZE, VOXEL_SIZE, VOXEL_SIZE);
+            const material = new THREE.MeshStandardMaterial({ color: 0x27ae60, roughness: 0.8 });
+
+            for (let x = -GRID_SIZE / 2; x < GRID_SIZE / 2; x++) {
+                for (let z = -GRID_SIZE / 2; z < GRID_SIZE / 2; z++) {
+                    const mesh = new THREE.Mesh(geometry, material);
+                    const px = x * VOXEL_SIZE, py = -VOXEL_SIZE / 2, pz = z * VOXEL_SIZE;
+                    mesh.position.set(px, py, pz);
+                    scene.add(mesh);
+
+                    const body = physicsWorld.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(px, py, pz));
+                    physicsWorld.createCollider(RAPIER.ColliderDesc.cuboid(VOXEL_SIZE / 2, VOXEL_SIZE / 2, VOXEL_SIZE / 2), body);
+                }
+            }
+        }
+
+        function createTestBox() {
+            const size = 0.25;
+            const mesh = new THREE.Mesh(
+                new THREE.BoxGeometry(size, size, size),
+                new THREE.MeshStandardMaterial({ color: 0xe67e22, roughness: 0.4 })
+            );
+            scene.add(mesh);
+
+            const bodyDesc = RAPIER.RigidBodyDesc.dynamic()
+                .setTranslation(0, 1.2, -0.4)
+                .setLinearDamping(1.0)
+                .setAngularDamping(1.0);
+            const body = physicsWorld.createRigidBody(bodyDesc);
+            physicsWorld.createCollider(RAPIER.ColliderDesc.cuboid(size / 2, size / 2, size / 2), body);
+
+            physicsBodies.push({ mesh, body });
+        }
+
+        function setupVR() {
+            const controllerModelFactory = new XRControllerModelFactory();
+
+            for (let i = 0; i < 2; i++) {
+                // Controllers
+                const grip = renderer.xr.getControllerGrip(i);
+                grip.add(controllerModelFactory.createControllerModel(grip));
+                scene.add(grip);
+
+                // Hands
+                const hand = renderer.xr.getHand(i);
+                scene.add(hand);
+                hands.push(hand);
+
+                // Procedural Voxel Joints
+                TRACKED_JOINTS.forEach(config => {
+                    const mesh = new THREE.Mesh(
+                        new THREE.BoxGeometry(config.size.x, config.size.y, config.size.z),
+                        new THREE.MeshStandardMaterial({ color: config.color, roughness: 0.7 })
+                    );
+                    mesh.visible = false;
+                    scene.add(mesh);
+
+                    const bodyDesc = RAPIER.RigidBodyDesc.kinematicPositionBased();
+                    const body = physicsWorld.createRigidBody(bodyDesc);
+                    const colDesc = RAPIER.ColliderDesc.cuboid(config.size.x / 2, config.size.y / 2, config.size.z / 2);
+                    physicsWorld.createCollider(colDesc, body);
+
+                    physicalVoxelJoints.push({ mesh, body, handRef: hand, jointName: config.name });
+                });
+            }
+        }
+
+        function update() {
+            // Sync Hands
+            const tempPos = new THREE.Vector3();
+            const tempQuat = new THREE.Quaternion();
+
+            physicalVoxelJoints.forEach(({ mesh, body, handRef, jointName }) => {
+                const joint = handRef.getJoint(jointName);
+
+                if (handRef.visible && joint && joint.visible) {
+                    // Extract World Transform
+                    joint.getWorldPosition(tempPos);
+                    joint.getWorldQuaternion(tempQuat);
+
+                    // Sync Graphics
+                    mesh.position.copy(tempPos);
+                    mesh.quaternion.copy(tempQuat);
+                    mesh.visible = true;
+
+                    // Sync Physics
+                    body.setNextKinematicTranslation({ x: tempPos.x, y: tempPos.y, z: tempPos.z });
+                    body.setNextKinematicRotation({ x: tempQuat.x, y: tempQuat.y, z: tempQuat.z, w: tempQuat.w });
+                } else {
+                    mesh.visible = false;
+                    body.setNextKinematicTranslation({ x: 0, y: -100, z: 0 }); // Teleport away
+                }
+            });
+
+            physicsWorld.step();
+
+            // Sync Dynamic Physics
+            physicsBodies.forEach(({ mesh, body }) => {
+                const t = body.translation();
+                const r = body.rotation();
+                mesh.position.set(t.x, t.y, t.z);
+                mesh.quaternion.set(r.x, r.y, r.z, r.w);
+            });
+
+            renderer.render(scene, camera);
+        }
+
+        function onResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+    </script>
+</body>
+
+</html>
