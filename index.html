@@ -42,45 +42,61 @@
 <body>
     <div id="overlay">
         <h2>WebXR Voxel Engine</h2>
-        <p>Quest 2 Procedural Joint Tracking</p>
+        <p id="status">Status: Waiting for Rapier...</p>
+        <pre id="logs" style="font-size: 10px; color: #ff5555;"></pre>
     </div>
     <script type="module">
         import * as THREE from 'three';
         import { VRButton } from 'three/addons/webxr/VRButton.js';
         import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
 
+        // Log helper
+        function log(msg) {
+            console.log(msg);
+            const el = document.getElementById('logs');
+            if (el) el.innerText += msg + '\n';
+        }
+
+        function setStatus(msg) {
+            const el = document.getElementById('status');
+            if (el) el.innerText = 'Status: ' + msg;
+        }
+
         // --- Configuration ---
         const VOXEL_SIZE = 0.5;
         const GRID_SIZE = 10;
-        const SPAWN_POS = new THREE.Vector3(0, 1.6, 1);
-
-        const TRACKED_JOINTS = [
-            { name: 'palm', size: { x: 0.07, y: 0.02, z: 0.07 }, color: 0x34495e },
-            { name: 'thumb-phalanx-distal', size: { x: 0.02, y: 0.02, z: 0.02 }, color: 0x2980b9 },
-            { name: 'index-finger-phalanx-distal', size: { x: 0.018, y: 0.018, z: 0.018 }, color: 0x3498db },
-            { name: 'middle-finger-phalanx-distal', size: { x: 0.018, y: 0.018, z: 0.018 }, color: 0x3498db },
-            { name: 'ring-finger-phalanx-distal', size: { x: 0.017, y: 0.017, z: 0.017 }, color: 0x3498db },
-            { name: 'pinky-finger-phalanx-distal', size: { x: 0.015, y: 0.015, z: 0.015 }, color: 0x2980b9 }
-        ];
+        const SPAWN_POS = new THREE.Vector3(0, 1.6, 2);
 
         // --- State ---
         let scene, camera, renderer, physicsWorld;
         let RAPIER;
         let controllers = [], hands = [];
-        let physicsBodies = []; // { mesh, body }
-        let physicalVoxelJoints = []; // { mesh, body, handRef, jointName }
+        let physicsBodies = [];
+        let physicalVoxelJoints = [];
 
         // --- Physics Initialization ---
-        import('https://cdn.skypack.dev/@dimforge/rapier3d-compat').then(async (R) => {
-            await R.init();
-            RAPIER = R;
-            init();
+        log('Attempting to load Rapier...');
+        import('https://cdn.jsdelivr.net/npm/@dimforge/rapier3d-compat@0.11.2/rapier.es.js').then(async (R) => {
+            log('Rapier module loaded, initializing WASM...');
+            try {
+                await R.init();
+                RAPIER = R;
+                log('Rapier initialized successfully.');
+                setStatus('Ready');
+                init();
+            } catch (e) {
+                log('Rapier Init Error: ' + e.message);
+                setStatus('Rapier Error');
+            }
+        }).catch(err => {
+            log('Rapier Load Error: ' + err.message);
+            setStatus('Load Failed');
         });
 
         function init() {
+            log('Initializing Three.js Scene...');
             scene = new THREE.Scene();
-            scene.background = new THREE.Color(0x101018);
-            scene.fog = new THREE.FogExp2(0x101018, 0.15);
+            scene.background = new THREE.Color(0x202028); // Lighter background to check if rendering
 
             camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 100);
             camera.position.copy(SPAWN_POS);
@@ -93,13 +109,22 @@
             document.body.appendChild(VRButton.createButton(renderer));
 
             // Lighting
-            scene.add(new THREE.AmbientLight(0xffffff, 0.5));
-            const sun = new THREE.DirectionalLight(0xffffff, 1.0);
+            scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+            const sun = new THREE.DirectionalLight(0xffffff, 0.8);
             sun.position.set(5, 10, 5);
             scene.add(sun);
 
             // Physics
             physicsWorld = new RAPIER.World({ x: 0.0, y: -9.81, z: 0.0 });
+
+            // Create a Debug Cube (Always visible even if physics fails)
+            const debugCube = new THREE.Mesh(
+                new THREE.BoxGeometry(0.1, 0.1, 0.1),
+                new THREE.MeshStandardMaterial({ color: 0xff00ff })
+            );
+            debugCube.position.set(0, 1.2, -0.2); // Right in front of face
+            scene.add(debugCube);
+            log('Scene objects created.');
 
             createTerrain();
             createTestBox();
@@ -177,7 +202,13 @@
             }
         }
 
+        let firstFrame = true;
         function update() {
+            if (firstFrame) {
+                log('First frame update triggered.');
+                firstFrame = false;
+            }
+
             // Sync Hands
             const tempPos = new THREE.Vector3();
             const tempQuat = new THREE.Quaternion();
