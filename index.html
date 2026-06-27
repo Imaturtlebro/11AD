@@ -118,7 +118,12 @@
             renderer.setSize(window.innerWidth, window.innerHeight);
             renderer.xr.enabled = true;
             document.body.appendChild(renderer.domElement);
-            document.body.appendChild(VRButton.createButton(renderer));
+
+            // Fix: Explicitly request hand-tracking features
+            document.body.appendChild(VRButton.createButton(renderer, {
+                requiredFeatures: ['local-floor'],
+                optionalFeatures: ['hand-tracking']
+            }));
 
             // Lighting
             scene.add(new THREE.AmbientLight(0xffffff, 0.5));
@@ -255,9 +260,10 @@
             const tempQuat = new THREE.Quaternion();
 
             physicalVoxelJoints.forEach(({ mesh, body, handRef, jointName }) => {
-                const joint = handRef.getJoint(jointName);
+                // Fix: Access joints directly from the Three.js joints object
+                const joint = handRef.joints ? handRef.joints[jointName] : null;
 
-                if (handRef.visible && joint && joint.visible) {
+                if (handRef.visible && joint) {
                     joint.getWorldPosition(tempPos);
                     joint.getWorldQuaternion(tempQuat);
                     mesh.position.copy(tempPos);
