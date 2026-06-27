@@ -73,8 +73,8 @@
 
         // --- State ---
         let scene, camera, renderer, physicsWorld;
+        let playerGroup; // Parent rig to move camera + controllers together
         let RAPIER;
-        let controllers = [], hands = [];
         let physicsBodies = [];
         let physicalVoxelJoints = [];
 
@@ -104,10 +104,14 @@
         function init() {
             log('Initializing Three.js...');
             scene = new THREE.Scene();
-            scene.background = new THREE.Color(0x3498db); // Bright blue background to verify rendering
+            scene.background = new THREE.Color(0x3498db); // Bright blue background
+
+            // Create Player Rig Group for Locomotion
+            playerGroup = new THREE.Group();
+            scene.add(playerGroup);
 
             camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 1000);
-            camera.position.set(0, 1.6, 3); // Start 3 meters back
+            playerGroup.add(camera); // Camera must be child of rig
 
             renderer = new THREE.WebGLRenderer({ antialias: true });
             renderer.setPixelRatio(window.devicePixelRatio);
@@ -115,10 +119,8 @@
             renderer.xr.enabled = true;
             document.body.appendChild(renderer.domElement);
 
-            // Fix: Explicitly request hand-tracking features
             document.body.appendChild(VRButton.createButton(renderer, {
-                requiredFeatures: ['local-floor'],
-                optionalFeatures: ['hand-tracking']
+                requiredFeatures: ['local-floor']
             }));
 
             // Lighting
@@ -143,7 +145,7 @@
             debugCube.position.set(0, 1.2, -1);
             scene.add(debugCube);
 
-            // 3. Setup VR Input (Graphics elements only)
+            // 3. Setup VR Input
             setupVR();
 
             log('Starting loop...');
@@ -158,7 +160,7 @@
                     const mesh = new THREE.Mesh(geometry, mat);
                     mesh.position.set(x * VOXEL_SIZE, -VOXEL_SIZE / 2, z * VOXEL_SIZE);
                     scene.add(mesh);
-                    physicsBodies.push({ mesh, body: null }); // Body added later
+                    physicsBodies.push({ mesh, body: null });
                 }
             }
         }
@@ -184,7 +186,7 @@
             scene.add(mesh);
 
             const bodyDesc = RAPIER.RigidBodyDesc.dynamic()
-                .setTranslation(0, 1.2, -0.4)
+                .setTranslation(0, 1.5, -0.6)
                 .setLinearDamping(1.0)
                 .setAngularDamping(1.0);
             const body = physicsWorld.createRigidBody(bodyDesc);
@@ -198,12 +200,15 @@
             physicalVoxelJoints = [];
 
             for (let i = 0; i < 2; i++) {
-                // Fetch the controller grip group from Three.js
+                // Controller input object (essential for tracking gamepad thumbsticks)
+                const controller = renderer.xr.getController(i);
+                playerGroup.add(controller);
+
+                // Controller grip object (best reference for visual hand/handle center)
                 const grip = renderer.xr.getControllerGrip(i);
                 grip.add(controllerModelFactory.createControllerModel(grip));
-                scene.add(grip);
+                playerGroup.add(grip); // Controllers must attach to playerGroup so they move when walking
 
-                // Find the configuration matching this index
                 const config = CONTROLLER_PROXIES[i];
 
                 // Create the visual box mesh that matches the controller position
@@ -211,13 +216,14 @@
                     new THREE.BoxGeometry(config.size.x, config.size.y, config.size.z),
                     new THREE.MeshStandardMaterial({ color: config.color, roughness: 0.5 })
                 );
-                mesh.visible = true;
+                mesh.visible = false; // Hidden until tracking acquisition flags true
                 scene.add(mesh);
 
                 physicalVoxelJoints.push({
                     mesh: mesh,
                     body: null,
                     gripRef: grip,
+                    controllerRef: controller,
                     configSize: config.size
                 });
             }
@@ -240,23 +246,64 @@
             });
         }
 
-        let firstFrame = true;
+        // --- Thumbstick Locomotion Logic ---
+        const moveSpeed = 0.04;
+        const moveDirection = new THREE.Vector3();
+        const frontVector = new THREE.Vector3();
+        const sideVector = new THREE.Vector3();
+        const camRotation = new THREE.Quaternion();
+
+        function handleLocomotion() {
+            physicalVoxelJoints.forEach(({ controllerRef }) => {
+                if (controllerRef && controllerRef.inputSource && controllerRef.inputSource.gamepad) {
+                    const source = controllerRef.inputSource;
+                    const gamepad = source.gamepad;
+
+                    // Isolate Left Thumbstick for locomotion
+                    if (source.handedness === 'left') {
+                        const xAxis = gamepad.axes[2] || 0; // Left / Right
+                        const yAxis = gamepad.axes[3] || 0; // Forward / Backward
+
+                        // Deadzone threshold filter
+                        if (Math.abs(xAxis) > 0.1 || Math.abs(yAxis) > 0.1) {
+                            camera.getWorldQuaternion(camRotation);
+
+                            // Project camera vector straight ahead onto horizontal XZ ground plane
+                            frontVector.set(0, 0, -1).applyQuaternion(camRotation);
+                            frontVector.y = 0;
+                            frontVector.normalize();
+
+                            // Project camera sideways vector onto horizontal XZ plane
+                            sideVector.set(1, 0, 0).applyQuaternion(camRotation);
+                            sideVector.y = 0;
+                            sideVector.normalize();
+
+                            // Aggregate thumbstick axes (WebXR standard maps up to negative Y)
+                            moveDirection.copy(frontVector).multiplyScalar(-yAxis);
+                            moveDirection.addScaledVector(sideVector, xAxis);
+                            moveDirection.normalize().multiplyScalar(moveSpeed);
+
+                            // Shift the entire tracking envelope
+                            playerGroup.position.add(moveDirection);
+                        }
+                    }
+                }
+            });
+        }
+
         function update() {
-            if (firstFrame) {
-                log('First frame update triggered.');
-                firstFrame = false;
-            }
+            // Apply walking vector adjustments to player rig
+            handleLocomotion();
 
             // Sync VR Controllers -> Physics Engine
             const tempScale = new THREE.Vector3();
 
             physicalVoxelJoints.forEach(({ mesh, body, gripRef }) => {
-                if (gripRef && gripRef.matrixWorld) {
-                    // Extract global position and rotation straight from the grip matrix
+                // Critical Fix: Only calculate tracking position if WebXR flags the device active
+                if (gripRef && gripRef.visible) {
                     gripRef.matrixWorld.decompose(mesh.position, mesh.quaternion, tempScale);
                     mesh.visible = true;
 
-                    // Feed the live coordinates directly into Rapier
                     if (body) {
                         const pos = mesh.position;
                         const quat = mesh.quaternion;
@@ -266,7 +313,7 @@
                 } else {
                     mesh.visible = false;
                     if (body) {
-                        body.setNextKinematicTranslation({ x: 0, y: -100, z: 0 }); // Park away
+                        body.setNextKinematicTranslation({ x: 0, y: -100, z: 0 }); // Park safe
                     }
                 }
             });
